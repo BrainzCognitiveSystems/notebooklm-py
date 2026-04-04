@@ -4,6 +4,7 @@ Commands:
     list       List all notebooks
     create     Create a new notebook
     delete     Delete a notebook
+    cleanup    Delete temporary test notebooks
     rename     Rename a notebook
     summary    Get notebook summary with AI-generated insights
     metadata   Export notebook metadata with sources list
@@ -24,6 +25,9 @@ from .helpers import (
     resolve_notebook_id,
     with_client,
 )
+
+
+TEMP_NOTEBOOK_PREFIX = "PW-Test-"
 
 
 def register_notebook_commands(cli):
@@ -132,6 +136,71 @@ def register_notebook_commands(cli):
                         console.print("[dim]Cleared current notebook context[/dim]")
                 else:
                     console.print("[yellow]Delete may have failed[/yellow]")
+
+        return _run()
+
+    @cli.command("cleanup")
+    @click.option(
+        "--prefix",
+        default=TEMP_NOTEBOOK_PREFIX,
+        show_default=True,
+        help="Delete notebooks whose title starts with this prefix.",
+    )
+    @click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
+    @with_client
+    def cleanup_cmd(ctx, prefix, yes, client_auth):
+        """Delete temporary notebooks created for testing.
+
+        By default, removes notebooks whose title starts with 'PW-Test-'.
+        """
+
+        async def _run():
+            async with NotebookLMClient(client_auth) as client:
+                notebooks = await client.notebooks.list()
+                candidates = [nb for nb in notebooks if (nb.title or "").startswith(prefix)]
+
+                if not candidates:
+                    console.print(f"[yellow]No notebooks found with prefix:[/yellow] {prefix}")
+                    return
+
+                if not yes and not click.confirm(
+                    f"Delete {len(candidates)} notebook(s) with prefix {prefix!r}?"
+                ):
+                    return
+
+                current_notebook = get_current_notebook()
+                deleted_count = 0
+                failed_ids: list[str] = []
+
+                for notebook in candidates:
+                    try:
+                        success = await client.notebooks.delete(notebook.id)
+                        if success:
+                            deleted_count += 1
+                            console.print(
+                                f"[green]Deleted notebook:[/green] {notebook.id} - {notebook.title}"
+                            )
+                            if current_notebook == notebook.id:
+                                clear_context()
+                                current_notebook = None
+                                console.print("[dim]Cleared current notebook context[/dim]")
+                        else:
+                            failed_ids.append(notebook.id)
+                    except Exception as exc:  # noqa: BLE001
+                        failed_ids.append(notebook.id)
+                        console.print(
+                            f"[yellow]Failed to delete notebook[/yellow] {notebook.id}: {exc}"
+                        )
+
+                console.print(
+                    f"[bold]Cleanup complete:[/bold] deleted {deleted_count} notebook(s) "
+                    f"with prefix {prefix!r}"
+                )
+                if failed_ids:
+                    console.print(
+                        f"[yellow]Failed to delete {len(failed_ids)} notebook(s):[/yellow] "
+                        + ", ".join(failed_ids)
+                    )
 
         return _run()
 

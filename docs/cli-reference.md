@@ -83,6 +83,7 @@ See [Configuration](configuration.md) for details on environment variables and C
 | `list` | List all notebooks | `notebooklm list` |
 | `create <title>` | Create notebook | `notebooklm create "Research"` |
 | `delete <id>` | Delete notebook | `notebooklm delete abc123` |
+| `cleanup` | Delete temporary test notebooks with the `PW-Test-` prefix | `notebooklm cleanup -y` |
 | `rename <title>` | Rename current notebook | `notebooklm rename "New Title"` |
 | `summary` | Get AI summary | `notebooklm summary` |
 

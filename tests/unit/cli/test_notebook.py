@@ -236,6 +236,100 @@ class TestNotebookDelete:
             assert "Delete may have failed" in result.output
 
 
+class TestNotebookCleanup:
+    def test_notebook_cleanup_deletes_prefixed_notebooks(self, runner, mock_auth):
+        with patch_main_cli_client() as mock_client_cls:
+            mock_client = create_mock_client()
+            mock_client.notebooks.list = AsyncMock(
+                return_value=[
+                    Notebook(
+                        id="nb_temp_1",
+                        title="PW-Test-alpha",
+                        created_at=datetime(2024, 1, 1),
+                        is_owner=True,
+                    ),
+                    Notebook(
+                        id="nb_keep_1",
+                        title="Keep-Me",
+                        created_at=datetime(2024, 1, 2),
+                        is_owner=True,
+                    ),
+                    Notebook(
+                        id="nb_temp_2",
+                        title="PW-Test-beta",
+                        created_at=datetime(2024, 1, 3),
+                        is_owner=True,
+                    ),
+                ]
+            )
+            mock_client.notebooks.delete = AsyncMock(return_value=True)
+            mock_client_cls.return_value = mock_client
+
+            with patch("notebooklm.cli.helpers.fetch_tokens", new_callable=AsyncMock) as mock_fetch:
+                mock_fetch.return_value = ("csrf", "session")
+                result = runner.invoke(cli, ["cleanup", "-y"])
+
+            assert result.exit_code == 0
+            assert "Cleanup complete" in result.output
+            mock_client.notebooks.delete.assert_any_call("nb_temp_1")
+            mock_client.notebooks.delete.assert_any_call("nb_temp_2")
+            assert mock_client.notebooks.delete.call_count == 2
+
+    def test_notebook_cleanup_clears_context_if_current(self, runner, mock_auth, tmp_path):
+        context_file = tmp_path / "context.json"
+        context_file.write_text('{"notebook_id": "nb_temp_1"}')
+
+        with patch_main_cli_client() as mock_client_cls:
+            mock_client = create_mock_client()
+            mock_client.notebooks.list = AsyncMock(
+                return_value=[
+                    Notebook(
+                        id="nb_temp_1",
+                        title="PW-Test-alpha",
+                        created_at=datetime(2024, 1, 1),
+                        is_owner=True,
+                    )
+                ]
+            )
+            mock_client.notebooks.delete = AsyncMock(return_value=True)
+            mock_client_cls.return_value = mock_client
+
+            with (
+                patch("notebooklm.cli.helpers.get_context_path", return_value=context_file),
+                patch("notebooklm.cli.notebook.get_current_notebook", return_value="nb_temp_1"),
+                patch("notebooklm.cli.notebook.clear_context"),
+                patch("notebooklm.cli.helpers.fetch_tokens", new_callable=AsyncMock) as mock_fetch,
+            ):
+                mock_fetch.return_value = ("csrf", "session")
+                result = runner.invoke(cli, ["cleanup", "-y"])
+
+            assert result.exit_code == 0
+            assert "Cleared current notebook context" in result.output
+
+    def test_notebook_cleanup_no_matches(self, runner, mock_auth):
+        with patch_main_cli_client() as mock_client_cls:
+            mock_client = create_mock_client()
+            mock_client.notebooks.list = AsyncMock(
+                return_value=[
+                    Notebook(
+                        id="nb_keep_1",
+                        title="Keep-Me",
+                        created_at=datetime(2024, 1, 1),
+                        is_owner=True,
+                    )
+                ]
+            )
+            mock_client_cls.return_value = mock_client
+
+            with patch("notebooklm.cli.helpers.fetch_tokens", new_callable=AsyncMock) as mock_fetch:
+                mock_fetch.return_value = ("csrf", "session")
+                result = runner.invoke(cli, ["cleanup", "-y"])
+
+            assert result.exit_code == 0
+            assert "No notebooks found with prefix" in result.output
+            mock_client.notebooks.delete.assert_not_called()
+
+
 # =============================================================================
 # NOTEBOOK RENAME TESTS
 # =============================================================================
@@ -600,6 +694,11 @@ class TestNotebookCommandsExist:
         assert result.exit_code == 0
         assert "Delete a notebook" in result.output
 
+    def test_cleanup_command_exists(self, runner):
+        result = runner.invoke(cli, ["cleanup", "--help"])
+        assert result.exit_code == 0
+        assert "Delete temporary notebooks" in result.output
+
     def test_rename_command_exists(self, runner):
         result = runner.invoke(cli, ["rename", "--help"])
         assert result.exit_code == 0
@@ -617,6 +716,7 @@ class TestNotebookCommandsExist:
         assert "list" in result.output
         assert "create" in result.output
         assert "delete" in result.output
+        assert "cleanup" in result.output
         assert "ask" in result.output
         # Verify there's no "notebook" command in the Commands section
         # (it should only appear as part of "NotebookLM" in the description)

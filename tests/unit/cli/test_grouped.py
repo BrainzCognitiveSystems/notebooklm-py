@@ -32,6 +32,7 @@ class TestSectionedHelp:
         assert "list" in result.output
         assert "create" in result.output
         assert "delete" in result.output
+        assert "cleanup" in result.output
         assert "rename" in result.output
         assert "share" in result.output
         assert "summary" in result.output
