@@ -472,9 +472,9 @@ class ClientCore:
             conversation_id: The conversation ID.
 
         Returns:
-            List of cached turns, or empty list if not found.
+            List of cached turns, or None if not found.
         """
-        return self._conversation_cache.get(conversation_id, [])
+        return self._conversation_cache.get(conversation_id)
 
     def clear_conversation_cache(self, conversation_id: str | None = None) -> bool:
         """Clear conversation cache.

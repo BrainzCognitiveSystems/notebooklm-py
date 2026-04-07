@@ -168,12 +168,11 @@ class ChatAPI:
         if server_conv_id:
             conversation_id = server_conv_id
 
-        turns = self._core.get_cached_conversation(conversation_id)
+        turns = self._core.get_cached_conversation(conversation_id) or []
+        turn_number = len(turns)
         if answer_text:
-            turn_number = len(turns) + 1
+            turn_number = turn_number + 1
             self._core.cache_conversation_turn(conversation_id, question, answer_text, turn_number)
-        else:
-            turn_number = len(turns)
 
         return AskResult(
             answer=answer_text,
@@ -185,7 +184,7 @@ class ChatAPI:
         )
 
     async def get_conversation_turns(
-        self, notebook_id: str, conversation_id: str, limit: int = 2
+        self, notebook_id: str, conversation_id: str, limit: int = 2,
     ) -> Any:
         """Get turns (individual messages) for a specific conversation.
 
@@ -249,6 +248,7 @@ class ChatAPI:
         notebook_id: str,
         limit: int = 100,
         conversation_id: str | None = None,
+        store_in_cache=True
     ) -> list[tuple[str, str]]:
         """Get Q&A history for the most recent conversation.
 
@@ -282,7 +282,13 @@ class ChatAPI:
             and isinstance(turns_data[0], list)
         ):
             turns_data = [list(reversed(turns_data[0]))]
-        return self._parse_turns_to_qa_pairs(turns_data)
+        qa_pairs = self._parse_turns_to_qa_pairs(turns_data)
+        if store_in_cache:
+            self.clear_cache(conv_id)
+            for turn_nbr, turn in enumerate(qa_pairs):
+                self._core.cache_conversation_turn(conv_id, turn[0], turn[1], turn_nbr + 1)
+
+        return qa_pairs
 
     @staticmethod
     def _parse_turns_to_qa_pairs(turns_data: Any) -> list[tuple[str, str]]:
@@ -331,15 +337,18 @@ class ChatAPI:
 
         Returns:
             List of ConversationTurn objects.
+            None if not found or if the cache is empty for this conversation.
         """
-        cached = self._core.get_cached_conversation(conversation_id)
+        cached_turns = self._core.get_cached_conversation(conversation_id)
+        if cached_turns is None:
+            return None
         return [
             ConversationTurn(
                 query=turn["query"],
                 answer=turn["answer"],
                 turn_number=turn["turn_number"],
             )
-            for turn in cached
+            for turn in cached_turns
         ]
 
     def clear_cache(self, conversation_id: str | None = None) -> bool:
