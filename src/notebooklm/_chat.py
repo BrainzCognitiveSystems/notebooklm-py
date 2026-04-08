@@ -64,6 +64,7 @@ class ChatAPI:
         question: str,
         source_ids: list[str] | None = None,
         conversation_id: str | None = None,
+        timeout_seconds: int = 300,
     ) -> AskResult:
         """Ask the notebook a question.
 
@@ -144,8 +145,14 @@ class ChatAPI:
         url = f"{QUERY_URL}?{query_string}"
 
         http_client = self._core.get_http_client()
+        timeout = httpx.Timeout(
+            connect=10,
+            read=timeout_seconds,
+            write=10,
+            pool=10,
+        )
         try:
-            response = await http_client.post(url, content=body)
+            response = await http_client.post(url, content=body, timeout=timeout)
             response.raise_for_status()
         except httpx.TimeoutException as e:
             raise NetworkError(
@@ -159,6 +166,8 @@ class ChatAPI:
                 f"Chat request failed: {e}",
                 original_error=e,
             ) from e
+        except Exception as e:
+            raise ChatError(f"Unexpected error during chat request: {e}") from e
 
         answer_text, references, server_conv_id = self._parse_ask_response_with_references(
             response.text
