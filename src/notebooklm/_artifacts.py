@@ -1898,6 +1898,7 @@ class ArtifactsAPI:
             remaining_time = timeout - elapsed
             sleep_duration = min(current_interval, remaining_time)
             if sleep_duration > 0:
+                logging.info("Task %s status=%s, sleeping for %.1f seconds before next poll", task_id, status.status, sleep_duration)
                 await asyncio.sleep(sleep_duration)
 
             # Exponential backoff: double the interval up to max_interval
@@ -2092,7 +2093,7 @@ class ArtifactsAPI:
                     notebook_id, pre_gen_ids, artifact_type
                 )
             else:
-                res =  self._parse_generation_result(res)
+                res =  self._parse_generation_result(result)
             logging.info(
                 "Generation RPC completed for type=%s notebook=%s with status=%s",
                 artifact_type,
