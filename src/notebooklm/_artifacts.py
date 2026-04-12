@@ -2041,6 +2041,11 @@ class ArtifactsAPI:
         Wraps the RPC call to handle UserDisplayableError (rate limiting/quota)
         and convert to appropriate GenerationStatus.
 
+        When the server returns a null response (which can happen when the API
+        processes artifact creation asynchronously), the method falls back to
+        listing the artifact catalog to recover the new task_id from the diff
+        between the pre- and post-generation snapshots.
+
         Args:
             notebook_id: The notebook ID.
             params: RPC parameters for the generation call.
@@ -2051,6 +2056,19 @@ class ArtifactsAPI:
         # Extract artifact type from params for logging
         artifact_type = params[2][2] if len(params) > 2 and len(params[2]) > 2 else "unknown"
         logger.debug("Generating artifact type=%s in notebook %s", artifact_type, notebook_id)
+
+        # Snapshot existing artifact IDs before the call so we can identify
+        # the newly created artifact when the server returns a null response.
+        try:
+            pre_gen_artifacts = await self._list_raw(notebook_id)
+            pre_gen_ids: builtins.set[str] = {
+                a[0]
+                for a in pre_gen_artifacts
+                if isinstance(a, list) and a and isinstance(a[0], str)
+            }
+        except Exception:
+            pre_gen_ids = set()
+
         try:
             result = await self._core.rpc_call(
                 RPCMethod.CREATE_ARTIFACT,
@@ -2058,7 +2076,30 @@ class ArtifactsAPI:
                 source_path=f"/notebook/{notebook_id}",
                 allow_null=True,
             )
-            return self._parse_generation_result(result)
+
+            if result is None:
+                # The server can return null for CREATE_ARTIFACT when it processes
+                # the request asynchronously (artifact created but ID not returned
+                # immediately).  Attempt to recover the task_id by listing artifacts
+                # and finding the one that appeared since our pre-generation snapshot.
+                logger.warning(
+                    "CREATE_ARTIFACT returned null for type=%s notebook=%s; "
+                    "attempting to recover task_id by listing artifacts",
+                    artifact_type,
+                    notebook_id,
+                )
+                res = await self._recover_task_id_after_null_response(
+                    notebook_id, pre_gen_ids, artifact_type
+                )
+            else:
+                res =  self._parse_generation_result(res)
+            logging.info(
+                "Generation RPC completed for type=%s notebook=%s with status=%s",
+                artifact_type,
+                notebook_id,
+                res.status,
+            )
+            return res
         except RPCError as e:
             if e.rpc_code == "USER_DISPLAYABLE_ERROR":
                 return GenerationStatus(
@@ -2068,6 +2109,111 @@ class ArtifactsAPI:
                     error_code=str(e.rpc_code) if e.rpc_code is not None else None,
                 )
             raise
+
+    async def _recover_task_id_after_null_response(
+        self,
+        notebook_id: str,
+        pre_gen_ids: builtins.set[str],
+        artifact_type: Any,
+    ) -> GenerationStatus:
+        """Recover a task_id after CREATE_ARTIFACT returned null.
+
+        Polls the artifact list looking for an entry that was not present in
+        the pre-generation snapshot, optionally filtered by artifact type.
+        Retries up to 3 times with a 2-second pause between attempts.
+
+        Args:
+            notebook_id: The notebook ID.
+            pre_gen_ids: Set of artifact IDs that existed *before* the
+                CREATE_ARTIFACT call.
+            artifact_type: The integer ArtifactTypeCode expected (or "unknown"
+                when the type is not available).
+
+        Returns:
+            GenerationStatus with the recovered task_id (status may be
+            "in_progress", "pending", "failed", etc.) or a failed
+            GenerationStatus when the artifact could not be found.
+        """
+        logging.info(
+            "Attempting to recover task_id for notebook=%s artifact_type=%s "
+            "by polling artifact list (up to 4 attempts with 2s delay)",
+            notebook_id,
+            artifact_type,
+        )
+        for attempt in range(4):
+            if attempt > 0:
+                await asyncio.sleep(2.0)
+            try:
+                post_gen_artifacts = await self._list_raw(notebook_id)
+                for art in post_gen_artifacts:
+                    if not isinstance(art, list) or not art:
+                        continue
+                    art_id = art[0]
+                    art_type = art[2] if len(art) > 2 else None
+                    # Skip artifacts that already existed before generation
+                    if not art_id or art_id in pre_gen_ids:
+                        continue
+                    # Filter by artifact type when known
+                    if artifact_type != "unknown" and art_type != artifact_type:
+                        continue
+                    status_code = art[4] if len(art) > 4 else None
+                    status = (
+                        artifact_status_to_str(status_code)
+                        if status_code is not None
+                        else "pending"
+                    )
+                    error_msg = (
+                        self._extract_artifact_error(art) if status == "failed" else None
+                    )
+                    if status == "failed":
+                        logger.warning(
+                            "Recovered artifact task_id=%s is already FAILED "
+                            "(type=%s, attempt=%d). Server error: %r. "
+                            "Raw art[0:10]=%r",
+                            art_id,
+                            art_type,
+                            attempt + 1,
+                            error_msg,
+                            art[:10],
+                        )
+                    else:
+                        logger.info(
+                            "Recovered task_id=%s (status=%s, type=%s) after null "
+                            "CREATE_ARTIFACT response (attempt %d)",
+                            art_id,
+                            status,
+                            art_type,
+                            attempt + 1,
+                        )
+                    return GenerationStatus(
+                        task_id=art_id,
+                        status=status,
+                        error=error_msg,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Attempt %d: failed to list artifacts for task_id recovery: %s",
+                    attempt + 1,
+                    exc,
+                )
+
+        logger.error(
+            "Could not recover task_id after null CREATE_ARTIFACT response "
+            "for notebook=%s type=%s. The server may have rejected the request "
+            "(quota limit, invalid parameters, or transient API error).",
+            notebook_id,
+            artifact_type,
+        )
+        return GenerationStatus(
+            task_id="",
+            status="failed",
+            error=(
+                "Generation failed: CREATE_ARTIFACT returned null and no new artifact "
+                "appeared in the catalog. The server may have rejected the request due "
+                "to a quota limit, invalid parameters, or a transient API error. "
+                "Check the NotebookLM web interface for details."
+            ),
+        )
 
     async def _list_raw(self, notebook_id: str) -> builtins.list[Any]:
         """Get raw artifact list data."""
