@@ -1890,15 +1890,19 @@ class ArtifactsAPI:
 
             elapsed = asyncio.get_running_loop().time() - start_time
             if elapsed > timeout:
-                raise TimeoutError(
-                    f"Task {task_id} timed out after {timeout}s (last status: {last_status})"
+                msg = f"Task {task_id} timed out after {timeout}s (last status: {last_status})"
+                logging.info(msg)
+                return GenerationStatus(
+                    task_id=task_id,
+                    status="failed",
+                    error=msg,
                 )
 
             # Clamp sleep duration to respect timeout
             remaining_time = timeout - elapsed
             sleep_duration = min(current_interval, remaining_time)
             if sleep_duration > 0:
-                logging.info("Task %s status=%s, sleeping for %.1f seconds before next poll", task_id, status.status, sleep_duration)
+                logging.info("Task %s status=%s, sleeping for %.1f seconds before next poll (timeout in %.0f seconds)", task_id, status.status, sleep_duration, remaining_time)
                 await asyncio.sleep(sleep_duration)
 
             # Exponential backoff: double the interval up to max_interval
