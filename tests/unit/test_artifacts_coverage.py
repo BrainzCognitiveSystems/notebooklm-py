@@ -753,6 +753,32 @@ class TestPollStatusMediaReadiness:
         assert status.status == "in_progress"
 
     @pytest.mark.asyncio
+    async def test_poll_status_video_pending_with_url_treats_as_completed(
+        self, mock_artifacts_api
+    ):
+        """Test poll_status returns completed when video URL is ready even if status is pending."""
+        api, mock_core = mock_artifacts_api
+
+        mock_core.rpc_call.return_value = [
+            [
+                [  # LIST_ARTIFACTS - video already has a ready URL
+                    "task_123",
+                    "Video Overview",
+                    3,  # VIDEO
+                    None,
+                    2,  # PENDING
+                    None,
+                    None,
+                    None,
+                    [["https://video.url/file.mp4", None, "video/mp4"]],
+                ]
+            ]
+        ]
+
+        status = await api.poll_status("nb_123", "task_123")
+        assert status.status == "completed"
+
+    @pytest.mark.asyncio
     async def test_poll_status_quiz_completed_without_url_check(self, mock_artifacts_api):
         """Test poll_status returns completed for quiz (no URL check needed)."""
         api, mock_core = mock_artifacts_api

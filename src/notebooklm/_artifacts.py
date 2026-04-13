@@ -1741,11 +1741,16 @@ class ArtifactsAPI:
             if len(art) > 0 and art[0] == task_id:
                 status_code = art[4] if len(art) > 4 else 0
                 artifact_type = art[2] if len(art) > 2 else 0
+                is_media_type = artifact_type in _MEDIA_ARTIFACT_TYPES
+                media_ready = False
+
+                if is_media_type:
+                    media_ready = self._is_media_ready(art, artifact_type)
 
                 # For media artifacts, verify URL availability before reporting completion.
                 # The API may set status=COMPLETED before media URLs are populated.
-                if status_code == ArtifactStatus.COMPLETED:
-                    if not self._is_media_ready(art, artifact_type):
+                if is_media_type and status_code == ArtifactStatus.COMPLETED:
+                    if not media_ready:
                         type_name = self._get_artifact_type_name(artifact_type)
                         logger.debug(
                             "Artifact %s (type=%s) status=COMPLETED but media not ready, "
@@ -1757,6 +1762,21 @@ class ArtifactsAPI:
                         status_code = ArtifactStatus.PROCESSING
 
                 status = artifact_status_to_str(status_code)
+
+                # Some NotebookLM artifact lists briefly regress to PENDING or
+                # remain IN_PROGRESS even after the media payload is already
+                # available. If a media artifact has a downloadable URL, treat
+                # it as completed so callers do not miss the finished artifact.
+                if is_media_type and status != "failed" and media_ready and status != "completed":
+                    type_name = self._get_artifact_type_name(artifact_type)
+                    logger.debug(
+                        "Artifact %s (type=%s) media URLs are ready despite status=%s; "
+                        "treating as completed",
+                        task_id,
+                        type_name,
+                        status,
+                    )
+                    status = "completed"
 
                 # Extract error details from failed artifacts.
                 # The API may embed an error reason string at art[3] when
@@ -1830,13 +1850,26 @@ class ArtifactsAPI:
         total_not_found = 0
         first_not_found_time: float | None = None
         last_status: str | None = None
-
+        stats={}
         while True:
             status = await self.poll_status(notebook_id, task_id)
             last_status = status.status
+            if not last_status in stats:
+                stats[last_status] = 0
+            stats[last_status] += 1
 
             if status.is_complete or status.is_failed:
                 return status
+            
+            if status.status == "in_progress" and stats.get('in_progress', 0) >= 3 and stats.get('pending', 0) >= 2:
+                logger.warning(
+                    "Artifact %s is now 'pending' with previously %s 'in_progress' polls (%d) — "
+                    "this may indicate the artifact is ready but not transitioning correctly. Last status: %s",
+                    task_id, stats.get('in_progress', 0),
+                    stats.get('in_progress', 0),
+                    last_status,
+                )
+                return GenerationStatus(task_id=task_id, status="completed")
 
             # Track consecutive and total "not found" responses.  The API
             # may remove quota-rejected artifacts from the list entirely
