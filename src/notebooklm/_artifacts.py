@@ -1935,7 +1935,7 @@ class ArtifactsAPI:
             remaining_time = timeout - elapsed
             sleep_duration = min(current_interval, remaining_time)
             if sleep_duration > 0:
-                logging.info("Task %s status=%s, sleeping for %.1f seconds before next poll (timeout in %.0f seconds)", task_id, status.status, sleep_duration, remaining_time)
+                logging.info("Task %s status=%s, sleeping %.0f sec (timeout in %.0f sec)", task_id, status.status, sleep_duration, remaining_time)
                 await asyncio.sleep(sleep_duration)
 
             # Exponential backoff: double the interval up to max_interval
