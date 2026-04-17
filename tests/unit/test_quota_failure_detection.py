@@ -1,7 +1,7 @@
 """Tests for quota/daily-limit failure detection during artifact polling.
 
 Regression tests for GitHub issue #239: when a daily quota is reached
-(e.g. Cinematics limit) the generation task silently polled until timeout
+(e.g. Cinematic limit) the generation task silently polled until timeout
 instead of failing quickly with a helpful error message.
 
 Root causes:
