@@ -77,6 +77,34 @@ def is_auth_error(error: Exception) -> bool:
 
     return False
 
+class RPCRetryParams:
+    """Parameters for RPC retry logic."""
+
+    def __init__(
+        self,
+        initial_failure_timestamp: float,
+        refresh_callback: Callable[[], Awaitable[AuthTokens]] | None = None,
+        refresh_retry_delay: float = 2,
+        refresh_retry_max_delay: float = 15*60.0,
+        refresh_retry_backoff_factor: float = 2.0,
+        refresh_retry_max_time_minutes: int = 3 * 60,
+    ):
+        """
+        Args:
+            initial_failure_timestamp: Timestamp of the initial RPC failure (time.perf_counter()).
+            refresh_callback: Optional async callback to refresh auth tokens on failure.
+                If provided, rpc_call will automatically retry once after refreshing.
+            refresh_retry_delay: Delay in seconds before retrying after refresh.
+            refresh_retry_max_delay: Maximum delay in seconds for retrying after refresh.
+            refresh_retry_backoff_factor: Multiplier for increasing delay on subsequent retries (not implemented in current logic, but reserved for future use if we want to add multiple retry attempts).
+            refresh_retry_max_time_minutes: Maximum time in minutes for retrying since initial failure.
+        """
+        self.initial_failure_timestamp = initial_failure_timestamp
+        self.refresh_callback = refresh_callback
+        self.refresh_retry_delay = refresh_retry_delay
+        self.refresh_retry_max_delay = refresh_retry_max_delay
+        self.refresh_retry_backoff_factor = refresh_retry_backoff_factor
+        self.refresh_retry_max_time_minutes = refresh_retry_max_time_minutes
 
 class ClientCore:
     """Core client infrastructure for HTTP and RPC operations.
@@ -97,7 +125,6 @@ class ClientCore:
         timeout: float = DEFAULT_TIMEOUT,
         connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
         refresh_callback: Callable[[], Awaitable[AuthTokens]] | None = None,
-        refresh_retry_delay: float = 0.2,
     ):
         """Initialize the core client.
 
@@ -109,13 +136,11 @@ class ClientCore:
                 A shorter connect timeout helps detect network issues faster.
             refresh_callback: Optional async callback to refresh auth tokens on failure.
                 If provided, rpc_call will automatically retry once after refreshing.
-            refresh_retry_delay: Delay in seconds before retrying after refresh.
         """
         self.auth = auth
         self._timeout = timeout
         self._connect_timeout = connect_timeout
         self._refresh_callback = refresh_callback
-        self._refresh_retry_delay = refresh_retry_delay
         self._refresh_lock: asyncio.Lock | None = asyncio.Lock() if refresh_callback else None
         self._refresh_task: asyncio.Task[AuthTokens] | None = None
         self._http_client: httpx.AsyncClient | None = None
