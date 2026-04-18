@@ -2,16 +2,17 @@
 
 import asyncio
 import json
+import time
 from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
 from pytest_httpx import HTTPXMock
 
-from notebooklm._core import ClientCore, is_auth_error
+from notebooklm._core import ClientCore, RPCRetryParams, is_auth_error
 from notebooklm.auth import AuthTokens
 from notebooklm.client import NotebookLMClient
-from notebooklm.rpc import AuthError, RPCError, RPCMethod
+from notebooklm.rpc import AuthError, RPCError, RateLimitError, RPCMethod
 
 
 @pytest.fixture
@@ -708,3 +709,239 @@ class TestRpcCallAutoRetry:
         assert (
             refresh_count[0] == 1
         ), f"Refresh should be called exactly once, got {refresh_count[0]}"
+
+
+class TestRpcCallRateLimitRetry:
+    @pytest.mark.asyncio
+    async def test_retries_on_http_429_with_exponential_backoff(self):
+        """rpc_call should retry HTTP 429 with exponential backoff."""
+        auth = AuthTokens(
+            cookies={"SID": "test"},
+            csrf_token="csrf",
+            session_id="sid",
+        )
+        core = ClientCore(auth, refresh_retry_delay=1.0, refresh_retry_backoff_factor=2.0)
+
+        call_count = [0]
+
+        async def mock_post(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] < 3:
+                request = httpx.Request("POST", args[0])
+                response = httpx.Response(429, request=request, headers={"retry-after": "1"})
+                raise httpx.HTTPStatusError("Too Many Requests", request=request, response=response)
+            response = MagicMock()
+            response.text = ')]}\'\n[["wrb.fr","wXbhsf",[["result"]]]]'
+            response.raise_for_status = MagicMock()
+            return response
+
+        core._http_client = MagicMock()
+        core._http_client.post = mock_post
+
+        with (
+            patch("notebooklm._core.decode_response", return_value=["result"]),
+            patch("notebooklm._core.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            result = await core.rpc_call(RPCMethod.LIST_NOTEBOOKS, [])
+
+        assert result == ["result"]
+        assert call_count[0] == 3
+        assert mock_sleep.await_count == 2
+        assert mock_sleep.await_args_list[0].args[0] == 1.0
+        assert mock_sleep.await_args_list[1].args[0] == 1.0
+
+    @pytest.mark.asyncio
+    async def test_retries_on_decoder_rate_limit_error(self):
+        """rpc_call should retry RateLimitError raised by decode_response."""
+        auth = AuthTokens(
+            cookies={"SID": "test"},
+            csrf_token="csrf",
+            session_id="sid",
+        )
+        core = ClientCore(auth, refresh_retry_delay=2.0)
+
+        async def mock_post(*args, **kwargs):
+            response = MagicMock()
+            response.text = "mock response"
+            response.raise_for_status = MagicMock()
+            return response
+
+        core._http_client = MagicMock()
+        core._http_client.post = mock_post
+
+        decode_call_count = [0]
+
+        def mock_decode(*args, **kwargs):
+            decode_call_count[0] += 1
+            if decode_call_count[0] == 1:
+                raise RateLimitError("rate limited", retry_after=2, method_id="wXbhsf")
+            return ["result"]
+
+        with (
+            patch("notebooklm._core.decode_response", side_effect=mock_decode),
+            patch("notebooklm._core.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            result = await core.rpc_call(RPCMethod.LIST_NOTEBOOKS, [])
+
+        assert result == ["result"]
+        assert decode_call_count[0] == 2
+        assert mock_sleep.await_count == 1
+        assert mock_sleep.await_args_list[0].args[0] == 2.0
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_retry_caps_at_max_delay(self):
+        """rpc_call should cap rate-limit retries at the configured max delay."""
+        auth = AuthTokens(
+            cookies={"SID": "test"},
+            csrf_token="csrf",
+            session_id="sid",
+        )
+        core = ClientCore(
+            auth,
+            refresh_retry_delay=1.0,
+            refresh_retry_max_delay=3.0,
+            refresh_retry_backoff_factor=10.0,
+            refresh_retry_max_time_minutes=10,
+        )
+
+        call_count = [0]
+
+        async def mock_post(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] < 3:
+                request = httpx.Request("POST", args[0])
+                response = httpx.Response(429, request=request)
+                raise httpx.HTTPStatusError("Too Many Requests", request=request, response=response)
+            response = MagicMock()
+            response.text = ')]}\'\n[["wrb.fr","wXbhsf",[["result"]]]]'
+            response.raise_for_status = MagicMock()
+            return response
+
+        core._http_client = MagicMock()
+        core._http_client.post = mock_post
+
+        with (
+            patch("notebooklm._core.decode_response", return_value=["result"]),
+            patch("notebooklm._core.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            result = await core.rpc_call(RPCMethod.LIST_NOTEBOOKS, [])
+
+        assert result == ["result"]
+        assert call_count[0] == 3
+        assert [call.args[0] for call in mock_sleep.await_args_list] == [1.0, 3.0]
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_retry_stops_after_total_window(self):
+        """rpc_call should not retry when the total retry window is exhausted."""
+        auth = AuthTokens(
+            cookies={"SID": "test"},
+            csrf_token="csrf",
+            session_id="sid",
+        )
+        expired_retry_params = RPCRetryParams(
+            initial_failure_timestamp=time.perf_counter() - (3 * 60 * 60 + 1),
+            refresh_retry_delay=1.0,
+            refresh_retry_max_delay=3.0,
+            refresh_retry_backoff_factor=2.0,
+            refresh_retry_max_time_minutes=3 * 60,
+        )
+        core = ClientCore(auth)
+
+        async def mock_post(*args, **kwargs):
+            request = httpx.Request("POST", args[0])
+            response = httpx.Response(429, request=request)
+            raise httpx.HTTPStatusError("Too Many Requests", request=request, response=response)
+
+        core._http_client = MagicMock()
+        core._http_client.post = mock_post
+
+        with (
+            patch("notebooklm._core.decode_response", return_value=["result"]),
+            patch("notebooklm._core.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+            pytest.raises(RateLimitError),
+        ):
+            await core.rpc_call(RPCMethod.LIST_NOTEBOOKS, [], retry_params=expired_retry_params)
+
+        assert mock_sleep.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_retry_respects_custom_retry_params(self):
+        """Custom retry_params should control backoff and max delay."""
+        auth = AuthTokens(
+            cookies={"SID": "test"},
+            csrf_token="csrf",
+            session_id="sid",
+        )
+        core = ClientCore(auth)
+
+        call_count = [0]
+
+        async def mock_post(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] < 3:
+                request = httpx.Request("POST", args[0])
+                response = httpx.Response(429, request=request, headers={"retry-after": "30"})
+                raise httpx.HTTPStatusError("Too Many Requests", request=request, response=response)
+            response = MagicMock()
+            response.text = ')]}\'\n[["wrb.fr","wXbhsf",[["result"]]]]'
+            response.raise_for_status = MagicMock()
+            return response
+
+        core._http_client = MagicMock()
+        core._http_client.post = mock_post
+
+        retry_params = RPCRetryParams(
+            refresh_retry_delay=1.0,
+            refresh_retry_max_delay=5.0,
+            refresh_retry_backoff_factor=2.0,
+            refresh_retry_max_time_minutes=10,
+        )
+
+        with (
+            patch("notebooklm._core.decode_response", return_value=["result"]),
+            patch("notebooklm._core.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            result = await core.rpc_call(RPCMethod.LIST_NOTEBOOKS, [], retry_params=retry_params)
+
+        assert result == ["result"]
+        assert call_count[0] == 3
+        assert [call.args[0] for call in mock_sleep.await_args_list] == [5.0, 5.0]
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_without_retry_params_does_not_loop_forever(self):
+        """Default retry params should still stop on rate limit exhaustion."""
+        auth = AuthTokens(
+            cookies={"SID": "test"},
+            csrf_token="csrf",
+            session_id="sid",
+        )
+        core = ClientCore(auth)
+
+        call_count = [0]
+
+        async def mock_post(*args, **kwargs):
+            call_count[0] += 1
+            request = httpx.Request("POST", args[0])
+            response = httpx.Response(429, request=request)
+            raise httpx.HTTPStatusError("Too Many Requests", request=request, response=response)
+
+        core._http_client = MagicMock()
+        core._http_client.post = mock_post
+
+        retry_params = RPCRetryParams(
+            initial_failure_timestamp=time.perf_counter() - (3 * 60 * 60 + 5),
+            refresh_retry_delay=1.0,
+            refresh_retry_max_delay=3.0,
+            refresh_retry_backoff_factor=2.0,
+            refresh_retry_max_time_minutes=3 * 60,
+        )
+
+        with (
+            patch("notebooklm._core.decode_response", return_value=["result"]),
+            patch("notebooklm._core.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+            pytest.raises(RateLimitError),
+        ):
+            await core.rpc_call(RPCMethod.LIST_NOTEBOOKS, [], retry_params=retry_params)
+
+        assert call_count[0] == 1
+        assert mock_sleep.await_count == 0

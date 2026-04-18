@@ -78,26 +78,35 @@ def is_auth_error(error: Exception) -> bool:
     return False
 
 class RPCRetryParams:
-    """Parameters for RPC retry logic."""
+    """Parameters and state for RPC retry logic.
+
+    This object is threaded through recursive `rpc_call()` retries so that
+    auth-refresh and rate-limit retries share the same total retry window.
+    """
 
     def __init__(
         self,
-        initial_failure_timestamp: float,
+        initial_failure_timestamp: float | None = None,
         refresh_callback: Callable[[], Awaitable[AuthTokens]] | None = None,
-        refresh_retry_delay: float = 2,
-        refresh_retry_max_delay: float = 15*60.0,
+        refresh_retry_delay: float = 2.0,
+        refresh_retry_max_delay: float = 30 * 60.0,
         refresh_retry_backoff_factor: float = 2.0,
-        refresh_retry_max_time_minutes: int = 3 * 60,
+        refresh_retry_max_time_minutes: float = 3 * 60,
     ):
-        """
+        """Initialize RPC retry parameters.
+
         Args:
-            initial_failure_timestamp: Timestamp of the initial RPC failure (time.perf_counter()).
-            refresh_callback: Optional async callback to refresh auth tokens on failure.
-                If provided, rpc_call will automatically retry once after refreshing.
-            refresh_retry_delay: Delay in seconds before retrying after refresh.
-            refresh_retry_max_delay: Maximum delay in seconds for retrying after refresh.
-            refresh_retry_backoff_factor: Multiplier for increasing delay on subsequent retries (not implemented in current logic, but reserved for future use if we want to add multiple retry attempts).
-            refresh_retry_max_time_minutes: Maximum time in minutes for retrying since initial failure.
+            initial_failure_timestamp: Timestamp of the first retryable RPC
+                failure (time.perf_counter()). If omitted, it is set on the
+                first retryable failure.
+            refresh_callback: Optional async callback to refresh auth tokens on
+                failure.
+            refresh_retry_delay: Base delay in seconds before retrying after a
+                retryable failure.
+            refresh_retry_max_delay: Maximum delay in seconds for any retry.
+            refresh_retry_backoff_factor: Multiplier for rate-limit retries.
+            refresh_retry_max_time_minutes: Maximum total retry window in
+                minutes since the first retryable failure.
         """
         self.initial_failure_timestamp = initial_failure_timestamp
         self.refresh_callback = refresh_callback
@@ -105,6 +114,50 @@ class RPCRetryParams:
         self.refresh_retry_max_delay = refresh_retry_max_delay
         self.refresh_retry_backoff_factor = refresh_retry_backoff_factor
         self.refresh_retry_max_time_minutes = refresh_retry_max_time_minutes
+        self.auth_refresh_attempted = False
+        self.rate_limit_retry_count = 0
+
+    @property
+    def max_retry_window_seconds(self) -> float:
+        """Return the maximum total retry window in seconds."""
+        return self.refresh_retry_max_time_minutes * 60.0
+
+    def start_retry_window(self) -> None:
+        """Initialize the retry window if it has not started yet."""
+        if self.initial_failure_timestamp is None:
+            self.initial_failure_timestamp = time.perf_counter()
+
+    def elapsed_since_first_failure(self) -> float:
+        """Return elapsed time since the first retryable failure."""
+        if self.initial_failure_timestamp is None:
+            return 0.0
+        return time.perf_counter() - self.initial_failure_timestamp
+
+    def retry_window_expired(self) -> bool:
+        """Return True if the total retry window has been exhausted."""
+        return self.elapsed_since_first_failure() >= self.max_retry_window_seconds
+
+    def can_retry_after_delay(self, delay: float) -> bool:
+        """Return True if there is enough retry budget left for `delay`."""
+        return self.elapsed_since_first_failure() + delay <= self.max_retry_window_seconds
+
+    def next_rate_limit_delay(self, retry_after: int | None = None) -> float:
+        """Calculate the next delay for a rate-limit retry.
+
+        `retry_after` takes precedence when supplied by the server. The final
+        delay is capped by `refresh_retry_max_delay`.
+        """
+        if retry_after is not None:
+            delay = float(max(0, retry_after))
+        else:
+            delay = self.refresh_retry_delay * (
+                self.refresh_retry_backoff_factor ** self.rate_limit_retry_count
+            )
+        return min(delay, self.refresh_retry_max_delay)
+
+    def mark_rate_limit_retry(self) -> None:
+        """Record that a rate-limit retry has been scheduled."""
+        self.rate_limit_retry_count += 1
 
 class ClientCore:
     """Core client infrastructure for HTTP and RPC operations.
@@ -125,6 +178,10 @@ class ClientCore:
         timeout: float = DEFAULT_TIMEOUT,
         connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
         refresh_callback: Callable[[], Awaitable[AuthTokens]] | None = None,
+        refresh_retry_delay: float = 2.0,
+        refresh_retry_max_delay: float = 30 * 60.0,
+        refresh_retry_backoff_factor: float = 2.0,
+        refresh_retry_max_time_minutes: float = 3 * 60,
     ):
         """Initialize the core client.
 
@@ -136,11 +193,20 @@ class ClientCore:
                 A shorter connect timeout helps detect network issues faster.
             refresh_callback: Optional async callback to refresh auth tokens on failure.
                 If provided, rpc_call will automatically retry once after refreshing.
+            refresh_retry_delay: Base delay for retryable RPC failures.
+            refresh_retry_max_delay: Maximum delay for a single retry.
+            refresh_retry_backoff_factor: Exponential backoff factor for
+                rate-limit retries.
+            refresh_retry_max_time_minutes: Maximum total retry window.
         """
         self.auth = auth
         self._timeout = timeout
         self._connect_timeout = connect_timeout
         self._refresh_callback = refresh_callback
+        self._refresh_retry_delay = refresh_retry_delay
+        self._refresh_retry_max_delay = refresh_retry_max_delay
+        self._refresh_retry_backoff_factor = refresh_retry_backoff_factor
+        self._refresh_retry_max_time_minutes = refresh_retry_max_time_minutes
         self._refresh_lock: asyncio.Lock | None = asyncio.Lock() if refresh_callback else None
         self._refresh_task: asyncio.Task[AuthTokens] | None = None
         self._http_client: httpx.AsyncClient | None = None
@@ -222,19 +288,20 @@ class ClientCore:
         params: list[Any],
         source_path: str = "/",
         allow_null: bool = False,
-        _is_retry: bool = False,
+        retry_params: RPCRetryParams | None = None,
     ) -> Any:
         """Make an RPC call to the NotebookLM API.
 
-        Automatically refreshes authentication tokens and retries once if an
-        auth failure is detected and a refresh_callback was provided.
+        Automatically refreshes authentication tokens and retries on
+        retryable failures when retry parameters are provided.
 
         Args:
             method: The RPC method to call.
             params: Parameters for the RPC call (nested list structure).
             source_path: The source path parameter (usually /notebook/{id}).
             allow_null: If True, don't raise error when response is null.
-            _is_retry: Internal flag to prevent infinite retries.
+            retry_params: Retry configuration/state for auth-refresh and
+                rate-limit retries.
 
         Returns:
             Decoded response data.
@@ -246,6 +313,26 @@ class ClientCore:
         """
         if not self._http_client:
             raise RuntimeError("Client not initialized. Use 'async with' context.")
+
+        if retry_params is None:
+            retry_params = RPCRetryParams(
+                refresh_callback=self._refresh_callback,
+                refresh_retry_delay=self._refresh_retry_delay,
+                refresh_retry_max_delay=self._refresh_retry_max_delay,
+                refresh_retry_backoff_factor=self._refresh_retry_backoff_factor,
+                refresh_retry_max_time_minutes=self._refresh_retry_max_time_minutes,
+            )
+        else:
+            if retry_params.refresh_callback is None and self._refresh_callback is not None:
+                retry_params.refresh_callback = self._refresh_callback
+            if retry_params.refresh_retry_delay == 2.0:
+                retry_params.refresh_retry_delay = self._refresh_retry_delay
+            if retry_params.refresh_retry_max_delay == 30 * 60.0:
+                retry_params.refresh_retry_max_delay = self._refresh_retry_max_delay
+            if retry_params.refresh_retry_backoff_factor == 2.0:
+                retry_params.refresh_retry_backoff_factor = self._refresh_retry_backoff_factor
+            if retry_params.refresh_retry_max_time_minutes == 3 * 60:
+                retry_params.refresh_retry_max_time_minutes = self._refresh_retry_max_time_minutes
 
         start = time.perf_counter()
         logger.debug("RPC %s starting", method.name)
@@ -260,10 +347,10 @@ class ClientCore:
         except (httpx.HTTPStatusError, httpx.RequestError) as e:
             elapsed = time.perf_counter() - start
 
-            # Check if this is an auth error and we can retry
-            if not _is_retry and self._refresh_callback and is_auth_error(e):
+            # Check if this is an auth error and we can retry once per window
+            if retry_params.refresh_callback and is_auth_error(e):
                 refreshed = await self._try_refresh_and_retry(
-                    method, params, source_path, allow_null, e
+                    method, params, source_path, allow_null, e, retry_params
                 )
                 if refreshed is not None:
                     return refreshed
@@ -290,9 +377,20 @@ class ClientCore:
                     msg = f"API rate limit exceeded calling {method.name}"
                     if retry_after:
                         msg += f". Retry after {retry_after} seconds"
-                    raise RateLimitError(
+                    rate_limit_error = RateLimitError(
                         msg, method_id=method.value, retry_after=retry_after
-                    ) from e
+                    )
+                    retry_result = await self._try_rate_limit_retry(
+                        method,
+                        params,
+                        source_path,
+                        allow_null,
+                        rate_limit_error,
+                        retry_params,
+                    )
+                    if retry_result is not None:
+                        return retry_result
+                    raise rate_limit_error from e
 
                 if 500 <= status < 600:
                     raise ServerError(
@@ -358,13 +456,22 @@ class ClientCore:
         except RPCError as e:
             elapsed = time.perf_counter() - start
 
-            # Check if this is an auth error and we can retry
-            if not _is_retry and self._refresh_callback and is_auth_error(e):
+            # Check if this is an auth error and we can retry once per window
+            if retry_params.refresh_callback and is_auth_error(e):
                 refreshed = await self._try_refresh_and_retry(
-                    method, params, source_path, allow_null, e
+                    method, params, source_path, allow_null, e, retry_params
                 )
                 if refreshed is not None:
                     return refreshed
+
+            if isinstance(e, RateLimitError):
+                # do not retry before at least 30 sec
+                retry_params.refresh_retry_delay = max(retry_params.refresh_retry_delay, 30.0)
+                retry_result = await self._try_rate_limit_retry(
+                    method, params, source_path, allow_null, e, retry_params
+                )
+                if retry_result is not None:
+                    return retry_result
 
             logger.error("RPC %s failed after %.3fs", method.name, elapsed)
             raise
@@ -383,6 +490,7 @@ class ClientCore:
         source_path: str,
         allow_null: bool,
         original_error: Exception,
+        retry_params: RPCRetryParams,
     ) -> Any | None:
         """Attempt to refresh auth tokens and retry the RPC call.
 
@@ -408,13 +516,23 @@ class ClientCore:
             method.name,
         )
 
-        # This function is only called when _refresh_callback is set
-        assert self._refresh_callback is not None
+        retry_params.start_retry_window()
+        if retry_params.retry_window_expired():
+            return None
+
+        # This function is only called when a refresh callback is set
+        assert retry_params.refresh_callback is not None
 
         # Use lock to coordinate refresh task creation
         # Note: refresh_callback is expected to update auth headers internally
         # Lock is always created when callback is set (see __init__)
-        assert self._refresh_lock is not None
+        if self._refresh_lock is None:
+            self._refresh_lock = asyncio.Lock()
+
+        if retry_params.auth_refresh_attempted:
+            return None
+
+        retry_params.auth_refresh_attempted = True
 
         # Determine which task to await (existing or new)
         async with self._refresh_lock:
@@ -425,7 +543,7 @@ class ClientCore:
             else:
                 # Start a new refresh task
                 # Cast needed: Awaitable → Coroutine for create_task (async funcs return coroutines)
-                coro = cast(Coroutine[Any, Any, AuthTokens], self._refresh_callback())
+                coro = cast(Coroutine[Any, Any, AuthTokens], retry_params.refresh_callback())
                 self._refresh_task = asyncio.create_task(coro)
                 refresh_task = self._refresh_task
 
@@ -437,13 +555,49 @@ class ClientCore:
             raise original_error from refresh_error
 
         # Brief delay before retry to avoid hammering the API
-        if self._refresh_retry_delay > 0:
-            await asyncio.sleep(self._refresh_retry_delay)
+        if retry_params.refresh_retry_delay > 0:
+            if not retry_params.can_retry_after_delay(retry_params.refresh_retry_delay):
+                return None
+            await asyncio.sleep(retry_params.refresh_retry_delay)
 
         logger.info("Token refresh successful, retrying RPC %s", method.name)
 
         # Retry with refreshed tokens
-        return await self.rpc_call(method, params, source_path, allow_null, _is_retry=True)
+        return await self.rpc_call(method, params, source_path, allow_null, retry_params=retry_params)
+
+    async def _try_rate_limit_retry(
+        self,
+        method: RPCMethod,
+        params: list[Any],
+        source_path: str,
+        allow_null: bool,
+        original_error: RateLimitError,
+        retry_params: RPCRetryParams,
+    ) -> Any | None:
+        """Attempt a delayed retry after a rate-limit error."""
+        retry_params.start_retry_window()
+
+        delay = retry_params.next_rate_limit_delay(original_error.retry_after)
+        if retry_params.retry_window_expired() or not retry_params.can_retry_after_delay(delay):
+            return None
+
+        retry_params.mark_rate_limit_retry()
+        if delay > 0:
+            logger.warning(
+                "RPC %s rate limited; retrying in %.1fs (attempt %s)",
+                method.name,
+                delay,
+                retry_params.rate_limit_retry_count,
+            )
+            await asyncio.sleep(delay)
+
+        return await self.rpc_call(
+            method,
+            params,
+            source_path,
+            allow_null,
+            retry_params=retry_params,
+        )
 
     def get_http_client(self) -> httpx.AsyncClient:
         """Get the underlying HTTP client for direct requests.

@@ -229,6 +229,11 @@ notebooklm source delete-by-title "Exact Source Title"
 
 Google enforces strict rate limits on the batchexecute endpoint.
 
+The Python client now automatically retries `RateLimitError` failures with
+exponential backoff. Retry delays honor any server-provided `Retry-After`
+value first, then fall back to the client's configured backoff policy. Retries
+stop once the configured total retry window is exhausted.
+
 **Symptoms:**
 - RPC calls return `None`
 - `RPCError` with ID `R7cb6c`
